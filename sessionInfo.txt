@@ -1,0 +1,33 @@
+R version 4.5.0 (2025-04-11)
+Platform: aarch64-apple-darwin20
+Running under: macOS 26.3
+
+Matrix products: default
+BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
+LAPACK: /Library/Frameworks/R.framework/Versions/4.5-arm64/Resources/lib/libRlapack.dylib;  LAPACK version 3.12.1
+
+locale:
+[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+time zone: America/New_York
+tzcode source: internal
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] synapser_2.0.0.200 ggtext_0.1.2       broom_1.0.8        writexl_1.5.4      readxl_1.4.5       gridExtra_2.3     
+ [7] patchwork_1.3.0    cowplot_1.1.3      RColorBrewer_1.1-3 corrplot_0.95      pheatmap_1.0.12    lubridate_1.9.4   
+[13] forcats_1.0.0      stringr_1.5.1      dplyr_1.1.4        purrr_1.0.4        readr_2.1.5        tidyr_1.3.1       
+[19] tibble_3.2.1       ggplot2_3.5.2      tidyverse_2.0.0    reshape2_1.4.4    
+
+loaded via a namespace (and not attached):
+ [1] gtable_0.3.6      rjson_0.2.23      xfun_0.52         lattice_0.22-6    tzdb_0.5.0        vctrs_0.6.5      
+ [7] tools_4.5.0       generics_0.1.3    parallel_4.5.0    pkgconfig_2.0.3   Matrix_1.7-3      lifecycle_1.0.4  
+[13] compiler_4.5.0    farver_2.1.2      codetools_0.2-20  litedown_0.7      pillar_1.10.2     crayon_1.5.3     
+[19] nlme_3.1-168      commonmark_1.9.5  tidyselect_1.2.1  stringi_1.8.7     labeling_0.4.3    splines_4.5.0    
+[25] rprojroot_2.0.4   grid_4.5.0        here_1.0.1        cli_3.6.5         magrittr_2.0.3    withr_3.0.2      
+[31] scales_1.4.0      backports_1.5.0   bit64_4.6.0-1     timechange_0.3.0  bit_4.6.0         reticulate_1.42.0
+[37] cellranger_1.1.0  png_0.1-8         hms_1.1.3         evaluate_1.0.3    knitr_1.50        markdown_2.0     
+[43] mgcv_1.9-1        rlang_1.1.6       gridtext_0.1.5    Rcpp_1.0.14       glue_1.8.0        xml2_1.3.8       
+[49] rstudioapi_0.17.1 vroom_1.6.5       jsonlite_2.0.0    R6_2.6.1          plyr_1.8.9       
