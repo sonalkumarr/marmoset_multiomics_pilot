@@ -1,0 +1,1625 @@
+---
+title: "Pilot Multiomics Master Analysis"
+author: "Sonal Kumar"
+format: 
+  html:
+    df-print: kable
+    code-overflow: wrap
+format-links: true
+toc: true
+colorlinks: true
+code-fold: false
+
+editor: visual
+execute:
+  warning: false
+  message: false
+  freeze: auto
+---
+
+This Quarto document details the transcriptomic and proteomic comparisons conducted for marmoset fibroblasts and induced human neurons from the ROSMAP-IN study.
+
+Cultured fibroblasts obtained from skin biopsies done for PSEN1 C410Y/A426P KI and wild-type marmosets. A NanoString panel of 770 genes was used for transcriptomics, and the label-free quantification for proteomics probed 2123 proteins. Human transcriptomic and proteomic data for induced neurons differentiated from iPSCs derived from 53 individuals in the ROSMAP cohort was available under the ROSMAP-IN study (https://www.synapse.org/Synapse:syn23564891).
+
+::: callout-note
+Please change filepaths and the include/eval code chunk headers in the source .qmd file to 'true' prior to running code.
+:::
+
+## 1. Loading all required packages
+
+```{r}
+#| label: loading libraries
+#| include: true
+
+library(reshape2)
+library(tidyverse)
+library(ggplot2)
+library(pheatmap)
+library(corrplot)
+library(RColorBrewer)
+library(cowplot)
+library(patchwork)
+library(gridExtra)
+library(readxl)
+library(writexl)
+library(purrr)
+library(broom)
+library(ggtext)
+library(synapser) #https://r-docs.synapse.org/articles/synapser.html#connecting-to-synapse
+```
+
+## 2. Logging into and downloading data from Synapse
+
+```{r}
+#| label: synapse login
+#| include: true
+
+synLogin() #via synapse config file stored in home directory with login credentials. for more details, check out documentation here: https://r-docs.synapse.org/articles/manageSynapseCredentials.html
+```
+
+This project directory has a subdirectory structure corresponding to 'data', 'results', and 'scripts', the latter of which contains this Quarto document. We begin by saving data in the correct location prior to analysis. I create subdirectories for the appropriate study in the data folder as needed.
+
+::: callout-note
+Note that the working directory is the source file location, i.e. the 'scripts' subdirectory within the project directory.
+:::
+
+```{r}
+#| label: creating subdirs
+#| eval: false
+
+#creating subdirs in the data dir according to study.
+dir.create("../data/rosmap-in")
+dir.create("../data/marmo")
+```
+
+We can get data from Synapse now that our download locations have been determined. I modified the default code that you can obtain on Synapse for programmatic downloads to only download the files of our interest, denoted by the given synIDs.
+
+```{r}
+#| label: downloading data and metadata
+#| eval: false
+
+# 1. ROSMAP-IN data download.
+
+#programmatically obtain a list of queries to be downloaded for the analysis: contains transcriptomics, proteomics, individual and biospecimen metadata files. 
+rosmapin_query <- synTableQuery("SELECT * FROM syn11346063.59 WHERE ( \"study\" HAS ( 'ROSMAP-IN' ) ) AND ( id IN ('syn25954748', 'syn25954751', 'syn25954752', 'syn25958845') )")
+rosmapin_query_table <- read_csv(rosmapin_query$filepath, show_col_types = FALSE) #this shows details for the files i wanted to download.
+
+#loop through the column of synIDs in the query table to download each file of our interest.
+purrr::walk(rosmapin_query_table$id, ~synGet(.x, downloadLocation = "../data/rosmap-in/"))
+
+#2. MARMO-AD omics pilot data download.
+
+#synIDs correspond to transcriptomics, proteomics, biospecimen and individual metadata.
+marmo_ids <- list('syn64544741', 'syn66641748', 'syn63927118', 'syn63926850') 
+for(i in 1:length(marmo_ids)){
+  synGet(entity = marmo_ids[[i]], downloadLocation = "../data/marmo/")
+}
+```
+
+## 3. RNA sequencing analysis
+
+### ROSMAP-IN RNASeq
+
+I begin with reading in the data associated with the transcriptomics part of the ROSMAP-IN study, followed by cleaning and preparing the data for downstream analysis.
+
+```{r}
+#| label: loading and preparing ROSMAP-IN RNAseq data and metadata for analysis
+#| include: true
+
+rosmapin_individual_metadata <- read_csv(file = "../data/rosmap-in/ROSMAP-IN_individual_metadata.csv", show_col_types = FALSE)
+rosmapin_biospecimen_metadata <- read_csv(file = "../data/rosmap-in/ROSMAP-IN_invitro_biospecimen_metadata.csv", show_col_types = FALSE)
+rosmapin_all_ids <- rosmapin_biospecimen_metadata %>%
+  select(1:3) #selecting the first three columns containing specimen and individual IDs.
+rosmapin_rna_counts <- read_csv(file = "../data/rosmap-in/ROSMAP_IN_RNAseq_gene.annotated.csv", show_col_types = FALSE) #these contain specimen ID sources for sample names, so we need to map those correctly with the IDs.
+
+#doing a left join for getting the correct IDs for our metadata.
+rosmapin_metadata <- left_join(rosmapin_individual_metadata, rosmapin_all_ids, by = "individualID") %>%
+  drop_na(specimenIdSource) %>% 
+  select(specimenIdSource, Sex = sex, APOE = apoeGenotype, Diagnosis = diagnosis, CERAD, Braak) %>%
+  distinct(specimenIdSource, .keep_all = TRUE)
+  #there's a few duplicated rows as the specimenID is different or many for the same individualID. we can get rid of those when we select the columns of our interest.
+```
+
+Matching up metadata info for sequenced samples.
+
+```{r}
+#| label: left join according to samples sequenced in ROSMAP-IN
+#| include: true
+
+#grabbing RNA counts (TPM) matrix headers corresponding to sample names for downstream processing.
+rosmapin_rna_headers <- colnames(rosmapin_rna_counts)
+
+#getting a list of the sample IDs that were sequenced.
+rosmapin_rna_headers <- as.data.frame(rosmapin_rna_headers) %>%
+  filter(str_detect(rosmapin_rna_headers, "BR")) %>%
+  select("specimenIdSource" = "rosmapin_rna_headers")
+
+#doing a left join using the list obtained above.
+rosmapin_metadata_RNA <- rosmapin_rna_headers %>%
+  left_join(., rosmapin_metadata, by = "specimenIdSource")
+```
+
+log2 transforming and filtering the TPM data.
+
+```{r}
+#| label: log transforming the ROSMAP-IN TPM data
+#| include: true
+
+rosmapin_log2_TPM <- rosmapin_rna_counts %>% 
+  mutate(across(starts_with("BR"), ~ log2(.))) #only converts the sample counts to be transformed.
+
+rosmapin_log2_TPM_filtered <- rosmapin_log2_TPM %>%
+  filter_if(is.numeric, any_vars(.>=3)) #filtered to have log2 transformed value >=3 in at least one column in every row.
+
+#checking for and retaining unique gene names.
+rosmapin_log2_TPM_filtered %>%
+  summarise(n_unique = n_distinct(ext_gene)) #there are a few duplicates. 
+
+rosmapin_log2_TPM_filtered <- rosmapin_log2_TPM_filtered %>%
+  filter(!str_detect(chr, "CHR")) %>% #filtering out any genes with a chromosome starting with 'CHR..".
+  distinct(ext_gene, .keep_all = TRUE) #keeping the first entry for a given gene.
+
+#saving gene name and ID for the filtered subset.
+rosmapin_rna_filtered_geneid <- rosmapin_log2_TPM_filtered$ens_gene
+rosmapin_rna_filtered_genes <- rosmapin_log2_TPM_filtered$ext_gene
+```
+
+Setting up a covariates matrix.
+
+```{r}
+#| label: making a dataframe for ROSMAP-IN covariates
+#| include: true
+
+minmax_scaling <- function(input_vector){ #function to scale CERAD and Braak values between 0 and 1.
+  min_input <- min(input_vector)
+  max_input <- max(input_vector)
+  scaled_input <- (input_vector - min_input)/(max_input - min_input)
+}
+
+#here the matrix is being recoded to allow binary categorization and scaling of the quantitative variables.
+rosmapin_covariates_RNA <- rosmapin_metadata_RNA %>%
+  mutate(Sex = case_when(
+    Sex == "female" ~ 0,
+    Sex == "male" ~ 1,
+    TRUE ~ NA),
+  APOE2 = case_when(
+    APOE %in% c(23, 22) ~ 1,
+    APOE %in% c(33, 34, 44) ~ 0,
+    TRUE ~ NA),
+  APOE4 = case_when(
+    APOE %in% c(23, 22, 33) ~ 0,
+    APOE %in% c(34, 44) ~ 1,
+    TRUE ~ NA),
+  AD_diagnosis = case_when(
+    Diagnosis == "Alzheimer Disease" ~ 1,
+    TRUE ~ 0),
+  CERADscaled = minmax_scaling(CERAD),
+  Braakscaled = minmax_scaling(Braak)) %>%
+  select(specimenIdSource, Sex, APOE2, APOE4, AD_diagnosis, CERAD = CERADscaled, Braak = Braakscaled)
+
+#visualizing the matrix.
+str(rosmapin_covariates_RNA)
+```
+
+Setting up multiple linear regressions
+
+```{r}
+#| label: multiple lms for all genes ROSMAP-IN
+#| include: true
+
+#preparing the RNA input.
+rosmapin_response_RNA <- rosmapin_log2_TPM_filtered %>%
+  select(starts_with("BR"))
+rosmapin_response_RNA <- t(rosmapin_response_RNA) #so that the format matches the covariates dataframe.
+rosmapin_response_RNA <- as.data.frame(rosmapin_response_RNA)
+dim(rosmapin_response_RNA)
+
+#creating a data frame to store gene IDs corresponding to models we will run later.
+rosmapin_model_gene_table <- data.frame(model_id = colnames(rosmapin_response_RNA),
+                                        gene = rosmapin_rna_filtered_genes)
+
+#creating a combined input for linear model.
+rosmapin_response_RNA$specimenIdSource <- rownames(rosmapin_response_RNA)
+rosmapin_RNA_combined_inputs <- rosmapin_response_RNA %>%
+  left_join(rosmapin_covariates_RNA, by = "specimenIdSource") 
+dim(rosmapin_RNA_combined_inputs) #this contains covariates and gene counts with sample IDs.
+
+#creating the formula and running the multiple linear models.
+rosmapin_RNA_lms <- map(colnames(select(rosmapin_RNA_combined_inputs, starts_with("V"))), ~ {
+  formula <- as.formula(paste0("`", .x, "` ~ Sex + APOE2 + APOE4 + AD_diagnosis + CERAD + Braak")) #the hyphen was causing issues, so inserted backticks for interpretation as a string.
+  lm(formula, data = rosmapin_RNA_combined_inputs)
+})
+
+#initializing an empty dataframe to store the output.
+df_rosmapin_RNAlms_output <- data.frame()
+
+#adding a column for covariates to be listed.
+coefficients <- as.data.frame(rownames(summary(rosmapin_RNA_lms[[1]])$coefficients)) %>%
+  select(covariates = `rownames(summary(rosmapin_RNA_lms[[1]])$coefficients)`)
+
+#running a loop to iteratively add in model information and coefficients.
+for(i in 1:length(rosmapin_RNA_lms)){
+  output <- summary(rosmapin_RNA_lms[[i]])$coefficients #gets summary output.
+  output <- cbind(output, coefficients) #adds in covariate labels.
+  model_id <- as.character(rosmapin_RNA_lms[[i]]$terms[[2]]) #gets model number (useful to ID genes later on).
+  output <- cbind(output, model_id) 
+  #iteratively add the outputs together.
+  df_rosmapin_RNAlms_output <- rbind(df_rosmapin_RNAlms_output, output)
+}
+
+#formatting the output.
+df_rosmapin_RNAlms_output <- df_rosmapin_RNAlms_output %>%
+  select(beta = Estimate, std_error = `Std. Error`, t_value = `t value`, p_value = `Pr(>|t|)`, covariates, model_id) %>%
+  left_join(., rosmapin_model_gene_table, by = "model_id")
+```
+
+Let's look at the number of differentially expressed genes for the ROSMAP-IN dataset for our model's covariates.
+
+```{r}
+#| label: counting differentially expressed genes for ROSMAP-IN
+#| include: true
+
+#adding a column for adjusted p-value by FDR.
+df_rosmapin_RNAlms_output <- df_rosmapin_RNAlms_output %>%
+  mutate(padj_value = p.adjust(p_value, method = "fdr")) %>%
+  filter(covariates != "(Intercept)") %>%
+  select(!model_id)
+
+#filtering differentially expressed genes based on FDR < 0.1.
+DEGs_FDR_rna_rosmap_in <- df_rosmapin_RNAlms_output %>%
+  filter(padj_value < 0.10)
+
+#counting DEGs.
+count(DEGs_FDR_rna_rosmap_in, covariates)
+
+#filtering based on basal p-values.
+annotated_diff_expr_rosmap_in_RNA <- df_rosmapin_RNAlms_output %>%
+  filter(p_value < 0.05)
+count(annotated_diff_expr_rosmap_in_RNA, covariates)
+```
+
+This concludes this section. Objects saved for outputs like `df_rosmapin_RNAlms_output` and `annotated_diff_expr_rosmap_in_RNA` will be used when putting it all together (see Section 5 of this document).
+
+### Marmoset fibroblast Nanostring data
+
+Reading in, cleaning, and preparing the data for downstream analysis for the NanoString experiment piloted for marmoset fibroblasts. This data was log2 normalized, and the complete description of data and preprocessing steps are given at xyz.
+
+```{r}
+#| label: loading and preparing marmoset Nanostring data and metadata for analysis
+#| include: true
+
+marmo_individual_metadata <- read_csv(file = "../data/marmo/individual_animal_metadata_MarmoAD.csv", show_col_types = FALSE)
+marmo_biospecimen_metadata <- read_csv(file = "../data/marmo/biospecimen_metadata_MarmoAD.csv", show_col_types = FALSE)
+marmo_rna_counts <- read_csv(file = "../data/marmo/nanostring-fibro_log2normalized_MarmoAD.csv", show_col_types = FALSE)
+
+#pulling specimen IDs from the Nanostring file, and using that to extract biospecimen and individual metadata.
+marmo_covariates <- data.frame(specimenID = marmo_rna_counts$specimenID) %>%
+  left_join(., marmo_biospecimen_metadata, by = "specimenID") %>%
+  left_join(., marmo_individual_metadata, by = "individualID") %>%
+  select(specimenID, sex, genotype) %>%
+  mutate(Sex = case_when(
+    sex == "female" ~ 0,
+    sex == "male" ~ 1,
+    TRUE ~ NA),
+    PSEN1_genotype = case_when(
+      genotype == "WT" ~ 0,
+      genotype == "PSEN1-C410Y_Y410/Y410" ~ 2, #this is the compound heterozygote.
+      TRUE ~ 1)) %>%
+  select(specimenID, Sex, PSEN1_genotype)
+
+#pulling list of genes assayed in NanoString that were filtered and retained for analysis.
+marmo_nano_genelist <- colnames(marmo_rna_counts)
+marmo_nano_genelist <- data.frame(gene = marmo_nano_genelist) %>%
+  slice(-(1:2)) #removing any labels that are not gene names.
+```
+
+Setting up multiple linear regressions.
+
+```{r}
+#| label: multiple lms for all MARMO Nanostring genes
+#| include: true
+
+#preparing the RNA input.
+marmo_response_nano <- marmo_rna_counts %>%
+  select(!individualID)
+marmo_nano_combined_inputs <- marmo_response_nano %>%
+  left_join(., marmo_covariates, by = "specimenID") %>%
+  as.data.frame()
+
+dim(marmo_nano_combined_inputs) #this contains covariates and gene counts with sample IDs.
+
+#creating the formula and running the multiple linear models.
+marmo_nano_lms <- map(colnames(select(marmo_nano_combined_inputs, A2M:ZNHIT3)), ~ {
+  formula <- as.formula(paste0("`", .x, "` ~ Sex + PSEN1_genotype")) #the hyphen is causing issues, so inserted backticks for interpretation as a string.
+  lm(formula, data = marmo_nano_combined_inputs)
+})
+
+#converting output to a dataframe.
+df_marmo_nanolms_output <- data.frame()
+#adding a column for covariates to be listed.
+coefficients <- as.data.frame(rownames(summary(marmo_nano_lms[[1]])$coefficients)) %>%
+  select(covariates = `rownames(summary(marmo_nano_lms[[1]])$coefficients)`)
+
+#running a loop to iteratively add in model information and coefficients.
+for(i in 1:length(marmo_nano_lms)){
+  output <- summary(marmo_nano_lms[[i]])$coefficients #gets summary output.
+  output <- cbind(output, coefficients) #adds in covariate labels.
+  gene <- as.character(marmo_nano_lms[[i]]$terms[[2]]) #gets model number (useful to ID genes).
+  output <- cbind(output, gene) 
+  #iteratively add the outputs together.
+  df_marmo_nanolms_output <- rbind(df_marmo_nanolms_output, output)
+}
+
+#formatting the output.
+df_marmo_nanolms_output <- df_marmo_nanolms_output %>%
+  select(beta = Estimate, std_error = `Std. Error`, t_value = `t value`, p_value = `Pr(>|t|)`, covariates, gene) #here model id is directly the gene name, so no annotation step is needed.
+```
+
+Let's look at the number of differentially expressed genes for the Marmoset Nanostring dataset for our model's covariates.
+
+```{r}
+#| label: counting differentially expressed genes for marmoset Nanostring
+#| include: true
+
+#adding a column for adjusted p-value by FDR.
+df_marmo_nanolms_output <- df_marmo_nanolms_output %>%
+  mutate(padj_value = p.adjust(p_value, method = "fdr"))
+
+supptable_S1 <- df_marmo_nanolms_output
+
+df_marmo_nanolms_output <- df_marmo_nanolms_output %>%
+  filter(covariates != "(Intercept)")
+
+#filtering differentially expressed genes based on adjusted p-value less than 0.1, and base p-values < 0.05.
+DEGs_FDR_marmo_nano <- df_marmo_nanolms_output %>%
+  filter(padj_value < 0.1)
+count(DEGs_FDR_marmo_nano, covariates)
+
+annotated_diff_expr_marmo_nano <- df_marmo_nanolms_output %>%
+  filter(p_value < 0.05)
+count(annotated_diff_expr_marmo_nano, covariates)
+```
+
+This concludes this section. Objects saved for outputs (for instance `annotated_diff_expr_marmo_nano`) will be used when putting it all together (see Section 5 of this document).
+
+## 4. Proteomics
+
+### ROSMAP-IN TMT proteomics assay
+
+Reading in, cleaning, and preparing proteomics data from the ROSMAP-IN study. The proteins are given in the form of their accession IDs. UniProt's ID mapping functionality was used to obtain gene and protein names.
+
+```{r}
+#| label: loading and preparing ROSMAP-IN proteomics data and metadata
+#| include: true
+
+#reading protein counts.
+rosmapin_protein_counts <- read_csv("../data/rosmap-in/data_proteomics_imputed.csv", show_col_types = FALSE)
+rosmapin_protein_counts <- rosmapin_protein_counts %>%
+  rename(accessionID = `...1`)
+
+#grabbing sample names for proteomics.
+rosmapin_protein_headers <- colnames(rosmapin_protein_counts[,-1])
+rosmapin_protein_headers <- sub(".*_", "", rosmapin_protein_headers) #changing the sample names to match up exactly as the RNASeq dataset.
+rosmapin_protein_headers <- as.data.frame(rosmapin_protein_headers)
+
+#getting metadata specifically for the proteomics samples.
+rosmapin_metadata_protein <- rosmapin_protein_headers %>%
+  left_join(., rosmapin_metadata, join_by(rosmapin_protein_headers == specimenIdSource))
+#recoding variables to prepare the covariates matrix.
+rosmapin_covariates_protein <- rosmapin_metadata_protein %>%
+  mutate(Sex = case_when(
+    Sex == "female" ~ 0,
+    Sex == "male" ~ 1,
+    TRUE ~ NA),
+  APOE2 = case_when(
+    APOE %in% c(23, 22) ~ 1,
+    APOE %in% c(33, 34, 44) ~ 0,
+    TRUE ~ NA),
+  APOE4 = case_when(
+    APOE %in% c(23, 22, 33) ~ 0,
+    APOE %in% c(34, 44) ~ 1,
+    TRUE ~ NA),
+  AD_diagnosis = case_when(
+    Diagnosis == "Alzheimer Disease" ~ 1,
+    TRUE ~ 0),
+  CERADscaled = minmax_scaling(CERAD),
+  Braakscaled = minmax_scaling(Braak)) %>%
+  select(specimenIdSource = rosmapin_protein_headers, Sex, APOE2, APOE4, AD_diagnosis, CERAD = CERADscaled, Braak = Braakscaled)
+
+#grabbing the protein accession IDs.
+rosmapin_proteinid <- rosmapin_protein_counts %>%
+  select(accessionID)
+
+#reading in the key for accession IDs, and modifying it and preparing for joining.
+rosmapin_prot_key <- read_tsv("../data/rosmap-in/idmapping_rosmapin.tsv",col_names = TRUE, show_col_types = FALSE)
+rosmapin_prot_key <- rosmapin_prot_key %>%
+  select(accessionID = From, gene = `Gene Names (primary)`)
+```
+
+Setting up multiple linear regressions
+
+```{r}
+#| label: multiple lms for all proteins in ROSMAP-IN
+#| include: true
+
+#preparing the protein input.
+rosmapin_response_protein <- rosmapin_protein_counts %>%
+  select(!accessionID)
+colnames(rosmapin_response_protein) <- sub(".*_", "", colnames(rosmapin_response_protein)) #making the sample names match.
+rosmapin_response_protein <- t(rosmapin_response_protein) #so that the format matches the covariates dataframe.
+rosmapin_response_protein <- as.data.frame(rosmapin_response_protein)
+dim(rosmapin_response_protein)
+
+#creating a data frame to store protein IDs corresponding to models we will run later.
+rosmapin_model_protein_table <- data.frame(model_id = colnames(rosmapin_response_protein),
+                                           protein_id = rosmapin_proteinid)
+
+#creating a combined input for linear model.
+rosmapin_response_protein$specimenIdSource <- rownames(rosmapin_response_protein)
+rosmapin_protein_combined_inputs <- rosmapin_response_protein %>%
+  left_join(rosmapin_covariates_protein, by = "specimenIdSource") 
+dim(rosmapin_protein_combined_inputs) #this contains covariates and protein counts with sample IDs.
+
+#creating the formula and running the multiple linear models.
+rosmapin_protein_lms <- map(colnames(select(rosmapin_protein_combined_inputs, starts_with("V"))), ~ {
+  formula <- as.formula(paste0("`", .x, "` ~ Sex + APOE2 + APOE4 + AD_diagnosis + CERAD + Braak")) #the hyphen is causing issues, so inserted backticks for interpretation as a string.
+  lm(formula, data = rosmapin_protein_combined_inputs)
+})
+
+#converting output to a dataframe.
+df_rosmapin_protein_lms_output <- data.frame()
+#adding a column for covariates to be listed.
+coefficients <- as.data.frame(rownames(summary(rosmapin_protein_lms[[1]])$coefficients)) %>%
+  select(covariates = `rownames(summary(rosmapin_protein_lms[[1]])$coefficients)`)
+
+#running a loop to iteratively add in model information and coefficients.
+for(i in 1:length(rosmapin_protein_lms)){
+  output <- summary(rosmapin_protein_lms[[i]])$coefficients #gets summary output.
+  output <- cbind(output, coefficients) #adds in covariate labels.
+  model_id <- as.character(rosmapin_protein_lms[[i]]$terms[[2]]) #gets model number (useful to ID genes later on).
+  output <- cbind(output, model_id) 
+  #iteratively add the outputs together.
+  df_rosmapin_protein_lms_output <- rbind(df_rosmapin_protein_lms_output, output)
+}
+
+#formatting the output.
+df_rosmapin_protein_lms_output <- df_rosmapin_protein_lms_output %>%
+  select(beta = Estimate, std_error = `Std. Error`, t_value = `t value`, p_value = `Pr(>|t|)`, covariates, model_id) %>%
+  left_join(., rosmapin_model_protein_table, by = "model_id") %>%
+  left_join(., rosmapin_prot_key, by = "accessionID") %>%
+  drop_na(gene)
+```
+
+Let's look at the number of differentially expressed proteins for the ROSMAP-IN dataset for our model's covariates. Additionally, annotating the differentially expressed proteins, and looking at the final number of identified proteins.
+
+```{r}
+#| label: counting differentially expressed proteins for ROSMAP-IN
+#| include: true
+
+#adding a column for adjusted p-value by FDR.
+df_rosmapin_protein_lms_output <- df_rosmapin_protein_lms_output %>%
+  mutate(padj_value = p.adjust(p_value, method = "fdr")) %>%
+  filter(covariates != "(Intercept)") %>%
+  distinct() #removes duplicated rows.
+
+#filtering differentially expressed genes based on p-value less than 0.05.
+DEGs_FDR_proteins_rosmap_in <- df_rosmapin_protein_lms_output %>%
+  filter(padj_value < 0.10)
+count(DEGs_FDR_proteins_rosmap_in, covariates)
+
+#creating another dataframe for base p-values.
+annotated_diff_expr_rosmap_in_protein <- df_rosmapin_protein_lms_output %>%
+  filter(p_value < 0.05) 
+count(annotated_diff_expr_rosmap_in_protein, covariates)
+```
+
+This concludes this section. The objects `df_rosmapin_protein_lms_output` and `annotated_diff_expr_rosmap_in_protein` will be used when putting it all together (see Section 5 of this document).
+
+### Marmoset fibroblast TMT proteomics assay
+
+Reading in, and preparing (log2 normalized) proteomics data for analysis from the marmoset fibroblasts. The proteins are given in the form of their accession IDs. Like before, UniProt's ID mapping functionality was used to obtain gene and protein names. The complete description of data preprocessing is given at xyz.
+
+```{r}
+#| label: loading and preparing marmoset proteomics data and metadata
+#| include: true
+
+#reading protein counts.
+marmo_protein_counts <- read_csv("../data/marmo/lfq-fibro_log2normalized_MarmoAD.csv", show_col_types = FALSE)
+
+#pulling specimen IDs from the counts file, and using that to extract biospecimen and individual metadata.
+marmo_prot_covariates <- data.frame(specimenID = marmo_protein_counts$specimenID) %>%
+  left_join(., marmo_biospecimen_metadata, by = "specimenID") %>%
+  left_join(., marmo_individual_metadata, by = "individualID") %>%
+  select(specimenID, sex, genotype) %>%
+  mutate(Sex = case_when(
+    sex == "female" ~ 0,
+    sex == "male" ~ 1,
+    TRUE ~ NA),
+    PSEN1_genotype = case_when(
+      genotype == "WT" ~ 0,
+      genotype == "PSEN1-C410Y_Y410/Y410" ~ 2,
+      TRUE ~ 1
+    )) %>%
+  select(specimenID, Sex, PSEN1_genotype)
+```
+
+Setting up multiple linear regressions.
+
+```{r}
+#| label: multiple lms for all MARMO proteins
+#| include: true
+
+#preparing the protein input.
+marmo_response_protein <- marmo_protein_counts %>%
+  select(!c(individualID, collectionDate))
+marmo_protein_combined_inputs <- marmo_response_protein %>%
+  left_join(., marmo_prot_covariates, by = "specimenID") %>%
+  as.data.frame() %>%
+  select_if(~ !any(is.na(.))) #dropping any columns with missing values for any samples.
+
+#checking dimensions.
+dim(marmo_protein_combined_inputs) #this contains covariates and gene counts with sample IDs.
+
+#getting marmo protein headers after filtering out NA columns.
+marmo_prot_headers <- data.frame(accessionID = colnames(marmo_protein_combined_inputs)) %>%
+  slice(-c(1, 2174, 2175)) #removing non-protein rows.
+
+#write_tsv(marmo_prot_headers, "../data/marmo/id_mapping_inputlist_marmo.tsv")
+#this list is fed into UniProt's ID Mapping tool to get gene names. this is now read in in the next step. downloaded in August 2025.
+
+#reading in the key for accession IDs, and modifying it.
+marmo_prot_key <- read_tsv("../data/marmo/idmapping_2025_08_13.tsv",col_names = TRUE, show_col_types = FALSE)
+marmo_prot_key <- marmo_prot_key %>%
+  select(accessionID = From, gene = `Gene Names (primary)`)
+
+#making a protein list for reference.
+marmo_protein_list <- marmo_prot_key %>%
+  select(gene) %>%
+  drop_na(gene) %>%
+  distinct()
+
+#creating the formula and running the multiple linear models.
+marmo_protein_lms <- map(colnames(select(marmo_protein_combined_inputs, P35579:B8ZZK2)), ~ {
+  formula <- as.formula(paste0("`", .x, "` ~ Sex + PSEN1_genotype")) #the hyphen is causing issues, so inserted backticks for interpretation as a string.
+  lm(formula, data = marmo_protein_combined_inputs)
+})
+
+#converting output to a dataframe.
+df_marmo_protlms_output <- data.frame()
+#adding a column for covariates to be listed.
+coefficients <- as.data.frame(rownames(summary(marmo_protein_lms[[1]])$coefficients)) %>%
+  select(covariates = `rownames(summary(marmo_protein_lms[[1]])$coefficients)`)
+
+#running a loop to iteratively add in model information and coefficients.
+for(i in 1:length(marmo_protein_lms)){
+  output <- summary(marmo_protein_lms[[i]])$coefficients #gets summary output.
+  output <- cbind(output, coefficients) #adds in covariate labels.
+  accessionID <- as.character(marmo_protein_lms[[i]]$terms[[2]]) #gets model number (useful to ID genes).
+  output <- cbind(output, accessionID) 
+  #iteratively add the outputs together.
+  df_marmo_protlms_output <- rbind(df_marmo_protlms_output, output)
+}
+
+#formatting the output and adding gene names.
+df_marmo_protlms_output <- df_marmo_protlms_output %>%
+  select(beta = Estimate, std_error = `Std. Error`, t_value = `t value`, p_value = `Pr(>|t|)`, covariates, accessionID) %>% #here model id is the accession ID.
+  left_join(., marmo_prot_key, by = "accessionID") %>% 
+  drop_na(gene) 
+```
+
+Let's look at the number of differentially expressed proteins for the marmoset fibroblasts dataset for our model's covariates.
+
+```{r}
+#| label: counting differentially expressed genes for marmoset fibroblasts
+#| include: true
+
+#adding a column for adjusted p-value by FDR.
+df_marmo_protlms_output <- df_marmo_protlms_output %>%
+  mutate(padj_value = p.adjust(p_value, method = "fdr")) 
+
+supptable_S2 <- df_marmo_protlms_output
+
+df_marmo_protlms_output <- df_marmo_protlms_output %>%
+  filter(covariates != "(Intercept)") %>%
+  distinct() #drop duplicated rows, if any.
+
+#filtering differentially expressed genes based on p-value less than 0.05.
+DEGs_FDR_marmo_protein <- df_marmo_protlms_output %>%
+  filter(padj_value < 0.10)
+
+count(DEGs_FDR_marmo_protein, covariates)
+
+#creating another file just based on p-value.
+annotated_diff_expr_marmo_protein <- df_marmo_protlms_output %>%
+  filter(p_value < 0.05) 
+
+count(annotated_diff_expr_marmo_protein, covariates)
+```
+
+This concludes this section. The list of proteins, called `marmo_protein_list`, in addition to the objects `df_marmo_protlms_output` and `annotated_diff_expr_marmo_protein` will be used when putting it all together (see Section 5 of this document).
+
+## 5. Putting it all together and final figures
+
+Figure 1: Comparing beta coefficients across transcriptomics and proteomics datasets from the ROSMAP-IN and marmoset fibroblast datasets.
+
+```{r}
+#| label: beta comparisons
+#| include: true
+
+#marmoset betas table, focusing on tests done for PSEN1 genotype as the factor of interest.
+marmo_nanos_betas <- df_marmo_nanolms_output %>% 
+  filter(covariates == "PSEN1_genotype") %>%
+  select(beta_rna = beta, gene, padj_value_rna = padj_value)
+#check NAs.
+sum(is.na(marmo_nanos_betas$beta_nano))
+
+marmo_prot_betas <- df_marmo_protlms_output %>%
+  filter(covariates == "PSEN1_genotype") %>%
+  drop_na(gene) %>%
+  select(beta_prot = beta, gene, padj_value_prot = padj_value) 
+
+#combining these two datasets.
+marmo_betas <- marmo_prot_betas %>%
+  left_join(., marmo_nanos_betas, by = "gene") %>%
+  drop_na() %>%
+  mutate(type = "Marmoset fibroblasts") %>%
+  distinct(gene, .keep_all = TRUE) #duplication due to different protein accession IDs mapping to same protein.
+
+#human ROSMAP-IN betas table, focusing on tests done for AD status as the factor of interest.
+rosmapin_RNA_betas <- df_rosmapin_RNAlms_output %>%
+  filter(covariates == "AD_diagnosis") %>%
+  select(beta_rna = beta, gene, padj_value_rna = padj_value) 
+#check NAs.
+sum(is.na(rosmapin_RNA_betas$beta_RNA))
+sum(duplicated(rosmapin_RNA_betas$gene))
+
+rosmapin_prot_betas <- df_rosmapin_protein_lms_output %>%
+  filter(covariates == "AD_diagnosis") %>%
+  select(beta_prot = beta, gene, padj_value_prot = padj_value) %>%
+  drop_na(gene) %>%
+  distinct(gene, .keep_all = TRUE) #removing multiple gene names.
+sum(duplicated(rosmapin_prot_betas$gene))
+
+#combining the two sets.
+rosmapin_betas <- rosmapin_prot_betas %>%
+  left_join(., rosmapin_RNA_betas, by = "gene") %>%
+  drop_na() %>%
+  mutate(type = "ROSMAP-IN") 
+sum(duplicated(rosmapin_betas$gene))
+
+#creating a combined dataset for the two betas.
+betas <- rbind(rosmapin_betas, marmo_betas)
+
+#calculating number of unique genes in both datasets.
+n_marmo_betas <- betas %>%
+  filter(type == "Marmoset fibroblasts") %>%
+  summarise(n = n_distinct(gene)) %>%
+  as.numeric()
+
+n_rosmapin_betas <- betas %>%
+  filter(type == "ROSMAP-IN") %>%
+  summarise(n = n_distinct(gene)) %>%
+  as.numeric()
+
+#calculating correlations, these will be used as text labels.
+corr_marmos <- cor.test(marmo_betas$beta_rna, marmo_betas$beta_prot)$estimate
+corr_marmos_p <- cor.test(marmo_betas$beta_rna, marmo_betas$beta_prot)$p.value
+
+corr_rosmapin <- cor.test(rosmapin_betas$beta_rna, rosmapin_betas$beta_prot)$estimate
+corr_rosmapin_p <- cor.test(rosmapin_betas$beta_rna, rosmapin_betas$beta_prot)$p.value
+
+#creating the label vector.
+betas_labs <- c("Marmoset fibroblasts" = paste0("<span style='font-size:10pt;color:dodgerblue4;'><b>Marmoset fibroblasts</b></span><br>ρ = ", round(corr_marmos, 2), ", <i>p</i> = ", round(corr_marmos_p, 5), "<br>N = ", n_marmo_betas, " genes"),
+                "ROSMAP-IN" = paste0("<span style='font-size:10pt;color:red3;'><b>ROSMAP iNs</b></span><br>ρ = ", round(corr_rosmapin, 2), ", <i>p</i> = ", round(corr_rosmapin_p, 23), "<br>N = ", n_rosmapin_betas, " genes"))
+
+#putting it all together and plotting the figure.
+plots_betas <- betas %>%
+  ggplot(., aes(x = beta_rna, y = beta_prot, color = type)) +
+  geom_point(size = 1, alpha = 0.5) + 
+  labs(x = "Estimated effect on RNA abundance",
+       y = "Estimated effect on protein\nabundance") +
+  geom_hline(yintercept = 0, linewidth = 0.2) +
+  geom_vline(xintercept = 0, linewidth = 0.2) +
+  geom_smooth(method = "lm", aes(fill = type), linewidth = 0.75) +
+  facet_grid(~ type, labeller = labeller(type = as_labeller(betas_labs))) +
+  theme_classic() +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.title = element_text(size = 10, face = "bold"),
+        strip.text = element_markdown(size = 8),
+        legend.position = "none") +
+  scale_color_manual(values = c("dodgerblue4", "red3")) +
+  scale_fill_manual(values = c("dodgerblue4", "red3")) 
+plots_betas
+#saving the plot.
+#ggsave2(filename = "figure1.pdf", plot = plots_betas, device = cairo_pdf, path = "../results/final_figs/", height = 80, width = 120, units = "mm", dpi = 600) #cairo_pdf helps retain the rho in the text label.
+```
+
+Figure 2: Building correlation table for transcriptomics results across the ROSMAP-IN and marmoset fibroblast datasets.
+
+```{r}
+#| label: correlation table
+#| include: true
+
+#naming the covariates and storing them in vectors.
+factors_rosmap_in <- c("AD_diagnosis", "APOE2", "APOE4", "Braak", "CERAD", "Sex")
+factors_marmos <- c("PSEN1_genotype", "Sex")
+
+#transcriptomics.
+corrtab_transcriptomics <- data.frame() #initializing empty dataframe to store results.
+
+for(i in 1:length(factors_rosmap_in)){
+  commongenes <- annotated_diff_expr_rosmap_in_RNA %>%
+    filter(covariates == factors_rosmap_in[i], gene %in% marmo_nano_genelist$gene) %>%
+    select(gene) #list of common genes.
+  
+  #getting the ROSMAP-IN dataset ready.
+  rna_genes <- annotated_diff_expr_rosmap_in_RNA %>%
+    filter(covariates == factors_rosmap_in[i], gene %in% commongenes$gene) %>%
+    distinct(gene, .keep_all = TRUE)
+  
+  for(j in 1:length(factors_marmos)){
+    #getting the marmoset dataset ready.
+    nano_genes <- df_marmo_nanolms_output %>%
+      filter(covariates == factors_marmos[j], gene %in% commongenes$gene) %>%
+      distinct(gene, .keep_all = TRUE)
+    
+    #calculating correlations.
+    master_genes <- rna_genes %>%
+      left_join(., nano_genes, by = "gene", suffix = c("_rna", "_nano"))
+    
+    #counting number of genes.
+    n_genes <- nrow(master_genes)
+    
+    corrs <- cor.test(master_genes$beta_rna, master_genes$beta_nano)
+    
+    #update the result.
+    corrtab_transcriptomics <- rbind(corrtab_transcriptomics, c(factors_rosmap_in[i], factors_marmos[j], corrs$estimate, corrs$p.value, n_genes))
+  }
+}
+
+colnames(corrtab_transcriptomics) <- c("rosmap-in", "marmo", "corr", "p-value", "n_genes")
+
+#proteomics.
+corrtab_proteomics <- data.frame() #initializing empty dataframe to store results.
+
+for(i in 1:length(factors_rosmap_in)){
+  commongenes <- annotated_diff_expr_rosmap_in_protein %>%
+    filter(covariates == factors_rosmap_in[i], gene %in% marmo_prot_key$gene) %>%
+    select(gene) #list of common genes.
+  
+  #getting the ROSMAP-IN dataset ready.
+  rosmapin_prots <- annotated_diff_expr_rosmap_in_protein %>%
+    filter(covariates == factors_rosmap_in[i], gene %in% commongenes$gene) %>%
+    distinct(gene, .keep_all = TRUE)
+  
+  for(j in 1:length(factors_marmos)){
+    #getting the marmoset dataset ready.
+    marmo_prots <- df_marmo_protlms_output %>%
+      filter(covariates == factors_marmos[j], gene %in% commongenes$gene) %>%
+      distinct(gene, .keep_all = TRUE)
+    
+    #calculating correlations.
+    master_prots <- rosmapin_prots %>%
+      left_join(., marmo_prots, by = "gene", suffix = c("_rosmapin", "_marmo"))
+    
+    #counting number of genes.
+    n_genes <- nrow(master_prots)
+    
+    corrs <- cor.test(master_prots$beta_rosmapin, master_prots$beta_marmo)
+    
+    #update the result.
+    corrtab_proteomics <- rbind(corrtab_proteomics, c(factors_rosmap_in[i], factors_marmos[j], corrs$estimate, corrs$p.value, n_genes))
+  }
+}
+
+colnames(corrtab_proteomics) <- c("rosmap-in", "marmo", "corr", "p-value", "n_genes")
+```
+
+Putting this together to plot the figure 2B.
+
+```{r}
+#| label: correlation plot, panel 2B
+#| include: true
+
+#adding an annotation column to denote data type.
+corrtab_transcriptomics <- corrtab_transcriptomics %>%
+  mutate(type = "Transcriptomics") 
+corrtab_proteomics <- corrtab_proteomics %>%
+  mutate(type = "Proteomics") 
+
+#joining dataframes together.
+corrtab_master <- rbind(corrtab_transcriptomics, corrtab_proteomics)
+corrtab_master <- corrtab_master %>%
+  mutate(corr = as.numeric(corr),
+         `p-value` = as.numeric(`p-value`),
+         type = factor(type, levels = c("Transcriptomics", "Proteomics")))
+
+#making the figure.
+corrs_plot <- ggplot(data = corrtab_master, aes(x = marmo, y = `rosmap-in`)) + 
+  geom_point(data = corrtab_master, mapping = aes(colour = corr, size = abs(corr))) +
+  facet_grid(~ type,
+             labeller = as_labeller(c(
+               "Transcriptomics" = "RNA",
+               "Proteomics" = "Protein"
+             ))) +
+  scale_color_gradient2(low = "dodgerblue4", mid = "white", high = "red3", midpoint = 0.0) +
+  theme_classic() +
+  geom_point(data = corrtab_master, show.legend = FALSE,
+             aes(alpha = ifelse(`p-value` < 0.05, 10, 0)),
+             color = "black", shape = 0, size = 10) +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.title = element_text(size = 10, face = "bold"),
+        strip.text = element_markdown(size = 10, face = "bold", hjust = 0.5),
+        legend.position = "right",
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 8),
+        legend.key.width = unit(3, "mm"),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.7),
+        axis.line = element_blank()) +
+  guides(size = "none") +
+  labs(x = "Marmoset fibroblasts",
+       y = "ROSMAP iNs",
+       color = "Pearson's\ncorrelation\ncoefficient") +
+  scale_x_discrete(labels = c("PSEN1_genotype" = "PSEN1\ngenotype","Sex" = "Sex\n(M)")) +
+  scale_y_discrete(labels = c("Sex" = "Sex\n(M)", "CERAD" = "CERAD", "Braak" = "Braak\nstage", "APOE4" = "APOE4\ngenotype", "APOE2" = "APOE2\ngenotype", "AD_diagnosis" = "AD\ndiagnosis"))
+
+corrs_plot #this is panel B for figure 2.
+```
+
+Figure 2A: Correlations driving gene sets for transcriptomic and proteomic signatures in both datasets by factors of interest (AD diagnosis and PSEN1 genotype). #label some gene names here???
+
+```{r}
+#| label: correlation scatter plot for AD status and PSEN1 genotype
+#| include: true
+
+#now we plot the actual effects used for calculating correlations previously. instead of running a nested loop, we can just run the commands directly for covariates of interest.
+
+#transcriptomics.
+commongenes <- annotated_diff_expr_rosmap_in_RNA %>%
+  filter(covariates == "AD_diagnosis", gene %in% marmo_nano_genelist$gene) %>%
+  select(gene) #list of common genes.
+  
+#getting the ROSMAP-IN dataset ready.
+rna_genes <- annotated_diff_expr_rosmap_in_RNA %>%
+  filter(covariates == "AD_diagnosis", gene %in% commongenes$gene) %>%
+  distinct(gene, .keep_all = TRUE)
+
+#getting the marmoset dataset ready.
+nano_genes <- df_marmo_nanolms_output %>%
+  filter(covariates == "PSEN1_genotype", gene %in% commongenes$gene) %>%
+  distinct(gene, .keep_all = TRUE)
+    
+#calculating correlations for a master dataset.
+effects_transcriptomics <- rna_genes %>% 
+  left_join(., nano_genes, by = "gene", suffix = c("_rosmapin", "_marmo")) %>%
+  mutate(type = "Transcriptomics") 
+    
+corrs_transcriptomics <- cor.test(effects_transcriptomics$beta_rosmapin, effects_transcriptomics$beta_marmo)
+
+#proteomics dataset.
+commongenes <- annotated_diff_expr_rosmap_in_protein %>%
+  filter(covariates == "AD_diagnosis", gene %in% marmo_prot_key$gene) %>%
+  select(gene) #list of common genes.
+  
+#getting the ROSMAP-IN dataset ready.
+rosmapin_prots <- annotated_diff_expr_rosmap_in_protein %>%
+    filter(covariates == "AD_diagnosis", gene %in% commongenes$gene) %>%
+    distinct(gene, .keep_all = TRUE)
+
+#getting the marmoset dataset ready.
+marmo_prots <- df_marmo_protlms_output %>%
+      filter(covariates == "PSEN1_genotype", gene %in% commongenes$gene) %>%
+      distinct(gene, .keep_all = TRUE)
+    
+#calculating correlations for a master dataset.
+effects_proteomics <- rosmapin_prots %>%
+  left_join(., marmo_prots, by = "gene", suffix = c("_rosmapin", "_marmo")) %>%
+  mutate(type = "Proteomics") %>%
+  select(-c("model_id", "accessionID_rosmapin", "accessionID_marmo"))
+    
+corrs_proteomics <- cor.test(effects_proteomics$beta_rosmapin, effects_proteomics$beta_marmo)
+
+#joining dataframes together.
+effects_AD_PSEN1 <- rbind(effects_transcriptomics, effects_proteomics) %>%
+  mutate(type = factor(type, levels = c("Transcriptomics", "Proteomics")))
+
+#calculating unique genes per data type.
+n_transcriptomics <- effects_AD_PSEN1 %>%
+  filter(type == "Transcriptomics") %>%
+  summarise(n = n_distinct(gene)) %>%
+  as.numeric()
+
+n_proteomics <- effects_AD_PSEN1 %>%
+  filter(type == "Proteomics") %>%
+  summarise(n = n_distinct(gene)) %>%
+  as.numeric()
+
+#creating a label vector for the plot.
+AD_PSEN1_labs <- c("Transcriptomics" = paste0("<span style='font-size:10pt;color:dodgerblue4;'><b>RNA</b></span><br>ρ = ", round(corrs_transcriptomics$estimate, 2), ", <i>p</i> = ", round(corrs_transcriptomics$p.value, 3), "<br>N = ", n_transcriptomics, " genes"),
+                "Proteomics" = paste0("<span style='font-size:10pt;color:red3;'><b>Protein</b></span><br>ρ = ", round(corrs_proteomics$estimate, 2), ", <i>p</i> = ", round(corrs_proteomics$p.value, 3), "<br>N = ", n_proteomics, " proteins"))
+
+#plotting the figure.
+AD_PSEN1_plot <- ggplot(data = effects_AD_PSEN1, aes(x = beta_rosmapin, y = beta_marmo, color = type, fill = type)) +
+  geom_point(size = 1, alpha = 0.5) +
+  labs(x = "Alzheimer's disease associated effects\nin ROSMAP iNs",
+       y = "PSEN1 genotype effects in\nmarmoset fibroblasts") +
+  geom_hline(yintercept = 0, size = 0.2) +
+  geom_vline(xintercept = 0, size = 0.2) +
+  geom_smooth(method = "lm", linewidth = 0.75) +
+  facet_grid(~ type, labeller = labeller(type = as_labeller(AD_PSEN1_labs))) +
+  theme_classic() +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.title = element_text(size = 10, face = "bold"),
+        strip.text = element_markdown(size = 8, hjust = 0.5),
+        legend.position = "none") +
+  scale_color_manual(values = c("dodgerblue4", "red3")) +
+  scale_fill_manual(values = c("dodgerblue4", "red3")) 
+AD_PSEN1_plot
+
+#arranging the plots together.
+fig2 <- plot_grid(AD_PSEN1_plot,
+                  corrs_plot,
+                  labels = c("A", "B"), label_size = 12, label_fontface = "bold",
+                  rel_widths = c(1, 1),
+                        ncol = 2)
+fig2
+
+#saving the plot.
+ggsave2(filename = "figure2.pdf", plot = fig2, device = cairo_pdf, path = "../results/final_figs/", height = 80, width = 180, units = "mm", dpi = 600)
+```
+
+Figure 3: Showing DEGs across transcriptomic and proteomic modalities, common to both covariates (males and PSEN1 carriers).
+
+Looking at Nanostring genes differentially expressed for both females and PSEN1 genotype. Contributes to panel A for figure 3.
+
+```{r}
+#| label: pulling out DEGs for nanostring and plotting
+#| include: true
+
+#creating a dataframe for significantly DEGs.
+sex_nano_DEGs <- df_marmo_nanolms_output %>%
+  filter(covariates == "Sex" & padj_value <= 0.1) %>%
+  select(gene, beta_sex = beta, p_value_sex = p_value, padj_value_sex = padj_value)
+
+psen1_nano_DEGs <- df_marmo_nanolms_output %>%
+  filter(covariates == "PSEN1_genotype" & padj_value <= 0.1) %>%
+  select(gene, beta_psen1 = beta, p_value_psen1 = p_value, padj_value_psen1 = padj_value)
+
+nano_DEGs <- psen1_nano_DEGs %>%
+  left_join(., sex_nano_DEGs, by = "gene") 
+
+PSEN1_genotype_nano_DEGs <- as.vector(nano_DEGs$gene)
+
+#generating plots for DEGs.
+
+#nanostring expression.
+marmo_DEGs_expr_plot_nano <- marmo_nano_combined_inputs %>%
+  select(PSEN1_genotype_nano_DEGs, Sex, PSEN1_genotype) %>% #creating a dataframe with necessary columns needed for plotting.
+  mutate(geno_sex_group = case_when(
+    Sex == 0 & PSEN1_genotype == 0 ~ "WT female",
+    Sex == 0 & PSEN1_genotype >= 1 ~ "PSEN1 female",
+    Sex == 1 & PSEN1_genotype == 0 ~ "WT male",
+    Sex == 1 & PSEN1_genotype >= 1 ~ "PSEN1 male",
+  )) %>%
+  mutate(geno_sex_group = factor(geno_sex_group, levels = c("WT male", "WT female", "PSEN1 male", "PSEN1 female")))
+
+#initialziing an empty list for storing plots.
+nano_expression_DEGs_plots <- list()
+
+#running a loop to generate plots for individual genes.
+for(i in 1:length(PSEN1_genotype_nano_DEGs)){
+  df <- marmo_DEGs_expr_plot_nano %>%
+    select(PSEN1_genotype_nano_DEGs[i], Sex, PSEN1_genotype, geno_sex_group)
+  
+  df_summary <- df %>%
+    group_by(geno_sex_group) %>%
+    summarize(mean = mean(.data[[PSEN1_genotype_nano_DEGs[i]]]),
+              sd = sd(.data[[PSEN1_genotype_nano_DEGs[i]]]),
+              se = sd/sqrt(n()),
+              CI_upper = mean + (1.96*se),
+              CI_lower = mean - (1.96*se))
+  
+  plot <- ggplot(data = df, aes(x = geno_sex_group, y = .data[[PSEN1_genotype_nano_DEGs[i]]])) +
+    geom_jitter(height = 0.025, width = 0, size = 1.5, aes(shape = as.factor(Sex))) +
+    geom_errorbar(data = df_summary, aes(x = geno_sex_group, y = mean, ymin = CI_lower, ymax = CI_upper), inherit.aes = FALSE, alpha = 0.75, width = 0, color = "dodgerblue4") +
+    geom_point(data = df_summary, aes(x = geno_sex_group, y = mean), inherit.aes = FALSE, alpha = 0.75, size = 1, color = "dodgerblue4") +
+    scale_alpha_identity() +
+    scale_color_identity() +
+    labs(x = "", 
+       y = "",
+       title = PSEN1_genotype_nano_DEGs[i],
+       color = "Genotype",
+       shape = "Sex") +
+    theme_classic() +
+    theme(axis.text = element_text(size = 8, color = "black"),
+          axis.ticks = element_line(color = "black"),
+          plot.title = element_text(size = 10, face = "bold.italic", hjust = 0.5),
+          axis.title = element_text(size = 10),
+          strip.text = element_markdown(size = 10),
+          legend.position = "none",
+          panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.7),
+          axis.line = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+  
+  print(plot)
+  
+  nano_expression_DEGs_plots[[PSEN1_genotype_nano_DEGs[i]]] <- plot
+}
+```
+
+Looking at proteins differentially expressed for both males and PSEN1 genotype. Contributes to panel 2 for figure 3.
+
+```{r}
+#| label: pulling out DEGs for proteomics and plotting.
+#| include: true
+
+#creating a dataframe for significantly DEGs.
+sex_prot_DEGs <- df_marmo_protlms_output %>%
+  filter(covariates == "Sex" & padj_value < 0.1) %>%
+  select(gene, beta_sex = beta, p_value_sex = p_value, padj_value_sex = padj_value, accessionID_sex = accessionID) 
+sum(duplicated(sex_prot_DEGs$gene)) #checking for duplicates.
+
+#get a list of DEGs for PSEN1 genotype.
+psen1_prot_DEGs <- df_marmo_protlms_output %>%
+  filter(covariates == "PSEN1_genotype" & padj_value < 0.1) %>%
+  select(gene, beta_psen1 = beta, p_value_psen1 = p_value, padj_value_psen1 = padj_value, accessionID_PSEN1 = accessionID)
+PSEN1_genotype_prot_DEGs <- as.vector(psen1_prot_DEGs$gene)
+
+prot_DEGs <- psen1_prot_DEGs %>%
+  left_join(., sex_prot_DEGs, by = "gene") 
+
+PSEN1_genotype_DEGs_prot <- as.vector(prot_DEGs$accessionID_PSEN1) #this has the accessions as the expression matrix is arranged by accession IDs.
+
+#generating plots for DEGs.
+
+#proteomics expression.
+marmo_DEGs_expr_plot_prot <- marmo_protein_combined_inputs %>%
+  select(PSEN1_genotype_DEGs_prot, Sex, PSEN1_genotype) %>% #creating a dataframe with necessary columns needed for plotting.
+  mutate(geno_sex_group = case_when(
+    Sex == 0 & PSEN1_genotype == 0 ~ "WT female",
+    Sex == 0 & PSEN1_genotype >= 1 ~ "PSEN1 female",
+    Sex == 1 & PSEN1_genotype == 0 ~ "WT male",
+    Sex == 1 & PSEN1_genotype >= 1 ~ "PSEN1 male",
+  )) %>%
+  mutate(geno_sex_group = factor(geno_sex_group, levels = c("WT male", "WT female", "PSEN1 male", "PSEN1 female")))
+
+#initializing an empty list for storing plots.
+prot_expression_DEGs_plots <- list()
+
+#running a loop to generate plots for individual genes.
+for(i in 1:length(PSEN1_genotype_DEGs_prot)){
+  df <- marmo_DEGs_expr_plot_prot %>%
+    select(PSEN1_genotype_DEGs_prot[i], Sex, PSEN1_genotype, geno_sex_group)
+  
+  df_summary <- df %>%
+    group_by(geno_sex_group) %>%
+    summarize(mean = mean(.data[[PSEN1_genotype_DEGs_prot[i]]]),
+              sd = sd(.data[[PSEN1_genotype_DEGs_prot[i]]]),
+              se = sd/sqrt(n()),
+              CI_upper = mean + (1.96*se),
+              CI_lower = mean - (1.96*se))
+  
+  plot <- ggplot(data = df, aes(x = geno_sex_group, y = .data[[PSEN1_genotype_DEGs_prot[i]]])) +
+    geom_jitter(height = 0.025, width = 0, size = 1.5, aes(shape = as.factor(Sex))) +
+    geom_errorbar(data = df_summary, aes(x = geno_sex_group, y = mean, ymin = CI_lower, ymax = CI_upper), inherit.aes = FALSE, alpha = 0.75, width = 0, color = "red3") +
+    geom_point(data = df_summary, aes(x = geno_sex_group, y = mean), inherit.aes = FALSE, size = 1, alpha = 0.75, color = "red3") +
+    scale_alpha_identity() +
+    scale_color_identity() +
+    labs(x = "", 
+       y = "",
+       title = prot_DEGs$gene[prot_DEGs$accessionID_PSEN1 == PSEN1_genotype_DEGs_prot[i]],
+       color = "Genotype",
+       shape = "Sex") +
+    theme_classic() +
+      theme(axis.text = element_text(size = 8, color = "black"),
+            axis.ticks = element_line(color = "black"),
+            axis.title = element_text(size = 10),
+            strip.text = element_markdown(size = 10),
+            plot.title = element_text(size = 10, face = "bold", hjust = 0.5),
+            legend.position = "none",
+            panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.7),
+            axis.line = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+  print(plot)
+  
+  prot_expression_DEGs_plots[[prot_DEGs$gene[prot_DEGs$accessionID_PSEN1 == PSEN1_genotype_DEGs_prot[i]]]] <- plot
+}
+```
+
+Putting figure 3 together. A. Panel 1 has 4 DEGs highlighted. (2x2) B. Panel 2 highlights 5 DEPs. (2x3 with an empty cell in row 2)
+
+```{r}
+#| label: assembling figure 3 panels
+#| include: true
+
+#choosing genes that are DEGs in both sex and PSEN1 genotype.
+intersect(psen1_nano_DEGs$gene, sex_nano_DEGs$gene) #RNA
+intersect(psen1_prot_DEGs$gene, sex_prot_DEGs$gene) #RNA
+
+GLOD4 <- nano_expression_DEGs_plots[["GLOD4"]] + #this is the first gene in the RNA panel.
+  labs(y = expression(bold("log"["2"]("counts"))))
+
+panelA <- plot_grid(NULL,
+                    GLOD4,
+                    nano_expression_DEGs_plots[["LAMB2"]],
+                    nano_expression_DEGs_plots[["PTPN5"]],
+                    nano_expression_DEGs_plots[["CD74"]],
+                    NULL,
+                    rel_widths = c(0.5, 1, 1, 1, 1, 0.5),
+                    ncol = 6,
+                    align = "hv",
+                    axis = "tblr")
+
+S100A10 <- prot_expression_DEGs_plots[["S100A10"]] +
+  labs(y = expression(bold("log"["2"]("intensity"))))
+
+panelB <- plot_grid(S100A10,
+                    prot_expression_DEGs_plots[["TMOD3"]],
+                    prot_expression_DEGs_plots[["GPX4"]],
+                    prot_expression_DEGs_plots[["COL12A1"]],
+                    prot_expression_DEGs_plots[["PCDHGA6"]],
+                    rel_widths = c(1, 1, 1, 1, 1),
+                    ncol = 5,
+                    align = "hv",
+                    axis = "tblr")
+
+
+figure3 <- plot_grid(panelA,
+                     panelB,
+                     nrow = 2,
+                     labels = c("A", "B"), label_size = 12, label_fontface = "bold",
+                     rel_heights = c(1,1))
+
+figure3
+#saving figure panel.
+ggsave2(filename = "figure3.pdf", plot = figure3, device = cairo_pdf, path = "../results/final_figs/", dpi = 600, width = 180, height = 110, units = "mm")
+```
+
+Figure 4: Studying enrichment across known consensus modules for significant genes. #figure out if protein has different system. #create a figure panel with both in there. #Also include GSEA.
+
+We will use Wan's consensus modules for transcriptomics alignment, and Johnson's consensus modules for proteomics. These modules can be downloaded from Synapse as shown below.
+
+```{r}
+#| label: consensus modules download
+#| include: false
+
+#Wan's consensus modules for transcriptomics alignment.
+#downloading AMP-AD module data from Synapse.
+dir.create("../data/modules")
+synGet(entity = "syn59500199", downloadLocation = "../data/modules/") #case vs control.
+synGet(entity = "syn59500213", downloadLocation = "../data/modules/") #sex-wise case vs control.
+
+
+#loading Johnson's module data from Synapse.
+synGet(entity = "syn61715847", downloadLocation = "../data/modules/") #case vs control.
+synGet(entity = "syn61715828", downloadLocation = "../data/modules/") #sex-stratified case vs control.
+```
+
+Reading them in and preparing for use.
+
+```{r}
+#| label: reading in consensus modules
+#| include: true
+
+#Wan's transcriptomics consensus modules.
+load("../data/modules/AMPADModuleData.RData") #this loads 3 objects: 2 dataframes called ampad_modules_fc and module_clusters, and a vector called mod.
+
+#modifying the module dataframe to be in a format consistent with our dataset.
+ampad_modules_fc <- ampad_modules_fc %>%
+  mutate(gene = toupper(Gene)) %>%
+  select(-Gene)
+
+#Johnson's proteomics consensus modules.
+load("../data/modules/Emory_Modules_withlogFC.RData") #this loads 4 objects: a vector called module_proteins, and 3 dataframes called pmod.AD.AsymAD, pmod.AD.Control, and pmod.AsymAD.Control. We will only use the vector and the pmod.AD.Control dataframe.
+
+#modifying the module dataframe to be in a format consistent with our dataset.
+protein_modules_fc <- pmod.AD.Control %>%
+  mutate(gene = toupper(Symbol)) %>%
+  select(-Symbol)
+```
+
+Aligning and plotting the overlap. Row 1 for figure 4, or figure 3A.
+
+```{r}
+#| label: Wan's consensus modules correlation plots
+#| include: true
+
+#preparing a master dataset for plotting.
+rna_effects_marmo <- df_marmo_nanolms_output %>%
+  filter(covariates != "(Intercept)") %>%
+  drop_na(gene) %>%
+  select(c("beta", "covariates", "gene")) %>%
+  mutate(type = "Marmoset\nfibroblasts")
+
+#function for calculating correlations between covariates using regression data and human data. code adapted from Dr. Ravi Pandey.
+corr_function_lm <- function(data, human_data){
+  #calculate correlations.
+  rna_vs_ampad_fc <- data  %>%
+    inner_join(human_data, by = c("gene")) %>%
+    group_by(module, covariates, type) %>%
+    nest(data = c(gene, beta, ampad_fc)) %>%
+    mutate(
+      cor_test = map(data, ~ cor.test(.x[["beta"]], .x[["ampad_fc"]], method = "pearson")),
+      estimate = map_dbl(cor_test, "estimate"),
+      p_value = map_dbl(cor_test, "p.value")) %>%
+    ungroup() %>%
+    dplyr::select(-cor_test)
+  
+  #process data for plotting.
+  #flagging significant results, adding cluster information to modules.
+  rna_effects_signif <- rna_vs_ampad_fc %>%
+    mutate(significant = p_value < 0.05) %>%
+    left_join(module_clusters, by = "module") %>%
+    dplyr::select(cluster, cluster_label, module, covariates, correlation = estimate, p_value, significant, type, data)
+  
+  # Create a version of the data for plotting - clean up naming, order factors, etc
+  rna_effects_for_plot.all <- rna_effects_signif %>%
+    arrange(cluster) %>%
+    mutate(Variant = factor(covariates),
+      Variant = fct_rev(Variant),
+      module = factor(module, levels = mod))
+}
+
+#generate data for plotting by calling the function.
+rna_effects_for_plotting <- corr_function_lm(rna_effects_marmo, ampad_modules_fc)
+
+#function for generating correlation plot. code adapted from Dr. Ravi Pandey.
+variant_corrplot_colored <- function(data, ran) {
+  p2 <- ggplot2::ggplot() +
+    ggplot2::geom_tile(
+      data = data,
+      ggplot2::aes(x = .data$module, y = .data$Variant),
+      colour = "black",
+      fill = "white"
+    ) +
+    ggplot2::geom_point(
+      data = dplyr::filter(data),
+      ggplot2::aes(
+        x = .data$module,
+        y = .data$Variant,
+        colour = .data$correlation,
+        size = abs(.data$correlation) 
+      )
+    ) +
+    ggplot2::geom_point(
+      data = dplyr::filter(data, .data$significant),
+      aes(
+        x = .data$module,
+        y = .data$Variant,
+        colour = .data$correlation
+      ),
+      color = "black",
+      shape = 0,
+      size = 5) +
+    ggplot2::scale_x_discrete(position = "top") +
+    ggplot2::scale_size(guide = "none", limits = c(0, ran), range = c(0.1, 4)) +
+    ggplot2::scale_color_gradient2(
+      limits = c(-ran, ran),
+      breaks = c(-ran, 0, ran),
+      low = "dodgerblue4",
+      high = "red3",
+      name = "Pearson's correlation coefficient",
+      guide = ggplot2::guide_colorbar(ticks = FALSE)
+    ) +
+    ggplot2::labs(x = NULL, y = NULL) +
+    #ggplot2::ggtitle("Perturbation| Control") +
+    ggplot2::facet_grid(
+      #rows = dplyr::vars(.data$Background),
+      cols = dplyr::vars(.data$cluster_label_new), #changed from cluster_label to cluster_label_new to accommodate labels in limited size.
+      scales = "free",
+      space = "free",
+      switch = "y"
+    ) +
+    ggplot2::theme(
+      strip.text.x = ggplot2::element_text(size = 8, face = "bold"),
+      strip.text.y.left = ggplot2::element_text(angle = 90, size = 8, face = "bold"),
+      strip.background.y = ggplot2::element_rect(fill = "grey95"),
+      axis.ticks = ggplot2::element_blank(),
+      axis.text.x = ggplot2::element_text(
+        angle = 90,
+        hjust = 0,
+        size = 8
+      ),
+      axis.text.y = ggplot2::element_text(size = 8),
+      plot.title = ggplot2::element_text(
+        angle = 0,
+        vjust = -56,
+        hjust = 0.01,
+        size = 10,
+        face = "bold"
+      ),
+      panel.background = ggplot2::element_blank(),
+      plot.title.position = "plot",
+      panel.grid = ggplot2::element_blank(),
+      legend.position = "bottom"#,
+      #legend.justification = c("right", "top")
+    ) + theme(legend.title = element_text(size = 8, hjust = 0.5),legend.text = element_text(size = 8), legend.key.height = unit(3, "mm"), legend.title.position = "top")
+  
+  fills <- c("grey95","grey95","grey95","grey95","grey95")
+  g <- ggplot_gtable(ggplot_build(p2))
+  stripr <- which(grepl('strip-t', g$layout$name))
+  k <- 1
+  for (i in stripr) {
+    j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+    g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+    k <- k+1
+  }
+  ggdraw(g)
+  
+}
+
+range(rna_effects_for_plotting$correlation) #second argument for the plotting function
+
+rna_effects_for_plotting_complete <- rna_effects_for_plotting %>%
+  mutate(Background = type,
+         Variant = if_else(Variant == "PSEN1_genotype", "PSEN1\ngenotype", Variant)) %>%
+  mutate(Variant = if_else(Variant == "Sex", "Sex (M)", Variant)) %>%
+  mutate(cluster_label_new = case_when(
+    cluster_label == "Consensus Cluster A\n(ECM organization)" ~ "Cluster A\n(ECM)",
+    cluster_label == "Consensus Cluster B\n(Immune system)" ~ "Cluster B\n(Immune system)",
+    cluster_label == "Consensus Cluster C\n(Neuronal system)" ~ "Cluster C\n(Neuronal system)",
+    cluster_label == "Consensus Cluster D\n(Cell Cycle, NMD)" ~ "Cluster D\n(Cell cycle, NMD)",
+    cluster_label == "Consensus Cluster E\n(Organelle Biogensis,\nCellular stress response)" ~ "Cluster E\n(Organelle biogenesis,\nCell stress response)"))
+  
+module_corr_plot_RNA <- variant_corrplot_colored(rna_effects_for_plotting_complete, 0.3)
+module_corr_plot_RNA #this is one panel for figure 3. let's call this panel A.
+```
+
+Looking at scatterplots for individual modules. Row 2 for figure 3.
+
+```{r}
+#| label: individual module scatter plots
+#| include: true
+
+#get a list of DEGs for PSEN1 genotype.
+psen1_nano_DEGs <- df_marmo_nanolms_output %>%
+  filter(covariates == "PSEN1_genotype" & padj_value < 0.1) %>%
+  select(gene, beta_psen1 = beta, p_value_psen1 = p_value, padj_value_psen1 = padj_value)
+PSEN1_genotype_nano_DEGs <- as.vector(psen1_nano_DEGs$gene)
+
+#initializing an empty list for storing plots.
+nano_modules_DEGs_plots <- list()
+
+#this prints all significant plots. we can choose the ones we need.
+for(i in 1:nrow(rna_effects_for_plotting)){
+  if(rna_effects_for_plotting[i,]$significant == TRUE){
+    p <- ggplot(data = rna_effects_for_plotting$data[[i]], aes(x = ampad_fc, y = beta)) +
+      geom_point(size = 1, color = "dodgerblue4", alpha = 0.5) +
+      labs(x = expression(bold(log["2"]("FC") * " in human AD brains")),
+           y = expression(bold(log["2"]("FC") * " in PSEN1 marmoset fibroblasts"))) +
+      ggtitle(label = rna_effects_for_plotting[i,]$module) +
+      #geom_text(data = rna_effects_for_plotting$data[[i]] %>% filter(gene %in% PSEN1_genotype_nano_DEGs), aes(label = gene, fontface = "italic"), size = 2, nudge_y = 0.045, color = "black") +
+      geom_hline(yintercept = 0, size = 0.20) +
+      geom_vline(xintercept = 0, size = 0.20) +
+      geom_smooth(method = "lm", color = "dodgerblue4", fill = "dodgerblue4", linewidth = 0.75) +
+      theme_classic() +
+      theme(axis.text = element_text(size = 8, color = "black"),
+            axis.ticks = element_line(color = "black"),
+            axis.title = element_text(size = 8),
+            strip.text = element_markdown(size = 8),
+            plot.title = element_text(hjust = 0.5, size = 10, face = "bold"),
+            legend.position = "none")
+      
+    print(p)
+    nano_modules_DEGs_plots[[paste0(rna_effects_for_plotting[i,]$module, "_", rna_effects_for_plotting[i,]$covariates)]] <- p #storing plots in a list to call later.
+  }
+}
+```
+
+Assembling figure 4. There are 2 rows: 1. Row 1 has one wide figure panel showing module correlations. 2. Row 2 has 3 significant module correlation plots.
+
+```{r}
+#| label: assembling panels for figure 4
+#| include: true
+
+#specifying plot arrangement via the 2 rows.
+row1 <- module_corr_plot_RNA 
+
+row2 <- plot_grid(nano_modules_DEGs_plots[["CBEturquoise_PSEN1_genotype"]],
+                  nano_modules_DEGs_plots[["STGblue_PSEN1_genotype"]],
+                  nano_modules_DEGs_plots[["DLPFCyellow_PSEN1_genotype"]],
+                  labels = c("B", "C", "D"), label_size = 12, label_fontface = "bold",
+                        rel_widths = c(1, 1, 1),
+                        ncol = 3)
+
+#row2_y <- ggdraw(row2) +
+#  draw_label(expression(bold("log"["2"]("FC") * " in PSEN1 marmoset fibroblasts")),
+#             x = 0.02, y = 0.5, angle = 90, fontfamily = "sans", size = 8)
+
+#assembling it all together.
+fig4 <- plot_grid(row1, 
+                  row2,
+                  nrow = 2,
+                  labels = c("A", ""), label_size = 12, label_fontface = "bold",
+                  rel_heights = c(1, 1))
+
+#saving figure panel.
+ggsave2(filename = "figure4.pdf", plot = fig4, device = cairo_pdf, path = "../results/final_figs/", height = 140, width = 180, units = "mm", dpi = 600)
+```
+
+Figure 5. Proteomics correlation plot using Johnson's protein modules. Panel 5A.
+
+```{r}
+#| label: Johnson's modules for proteomics correlations
+#| include: true
+
+#preparing a master dataset for plotting.
+prot_effects_marmo <- df_marmo_protlms_output %>%
+  filter(covariates != "(Intercept)") %>%
+  drop_na(gene) %>%
+  select(c("beta", "covariates", "gene")) %>%
+  mutate(type = "Marmoset fibroblasts")
+
+#function for calculating correlation between covariates using regression data and human data. code adapted from Dr. Ravi Pandey.
+corr_function_proteomics <- function(data, ref){
+  prot_vs_ampad_fc.all <- data  %>%
+  inner_join(ref, by = c("gene")) %>%
+  group_by(Module, covariates) %>%
+  nest(data = c(gene, beta, AD.Control)) %>%
+  mutate(cor_test = map(data, ~ cor.test(.x[["beta"]], .x[["AD.Control"]], method = "pearson")),
+         estimate = map_dbl(cor_test, "estimate"),
+         p_value = map_dbl(cor_test, "p.value")) %>%
+    ungroup() %>%
+    dplyr::select(-cor_test)
+  
+  prot_vs_ampad_fc.all$padj <- p.adjust(prot_vs_ampad_fc.all$p_value, method = "fdr")
+  
+  prot.all <- prot_vs_ampad_fc.all %>%
+    mutate(significant = padj < 0.1) %>%
+    mutate(significant1 = p_value < 0.05) %>%
+    dplyr::select(Module, covariates, correlation = estimate, p_value, significant, significant1, type, data) %>% 
+    as.data.frame(.)
+  
+  prot_for_plot.all <- prot.all %>%
+    arrange(Module) %>%
+    mutate(Module = factor(Module,levels=module_proteins))
+} 
+
+#generate data for plotting by calling the function.
+prot_effects_for_plotting <- corr_function_proteomics(prot_effects_marmo, protein_modules_fc)
+
+#list of modules with known links to AD.
+AD_modules <- c("M1_Synapse_Neuron","M2_Mitochondria","M3_Oligo_Myelination","M4_Synapse_Neuron","M5_Post-Synaptic_Density","M7_MAPK_Metabolism","M8_Protein_Transport","M11_Cell-ECM_Interaction","M13_RNA_Splicing","M18_RNA_Splicing","M20_RNA_Splicing","M22_Post-Synaptic_Density","M24_Ubiquitination","M25_Sugar_Metabolism", "M29_Glycosylation_ER", "M42_Matrisome")
+
+#function for generating correlation plot for Johnson's modules. code adapted from Dr. Ravi Pandey.
+protein_variant_corrplot <- function(data, ran){
+  ggplot2::ggplot() +
+  ggplot2::geom_tile(data = data, ggplot2::aes(x = .data$Module, y = .data$covariates_label), colour = "black", fill = "white") +
+  ggplot2::geom_point(data = dplyr::filter(data), ggplot2::aes(x = .data$Module, y = .data$covariates_label, colour = .data$correlation, size = abs(.data$correlation))) +
+  ggplot2::geom_point(data = dplyr::filter(data, .data$significant1), ggplot2::aes(x = .data$Module, y = .data$covariates_label, colour = .data$correlation), color = "black", shape = 0, size = 4.5) +
+    #ggplot2::geom_point(data = dplyr::filter(data, .data$significant), ggplot2::aes(x = .data$Module, y = .data$covariates_label, colour = .data$correlation),color="red",shape=0,size=9) +
+  ggplot2::scale_x_discrete(position = "top", labels = function(x) gsub("_", " ", x), expand = c(0, 0)) +
+    ggplot2::scale_y_discrete(labels = function(x) gsub("_", " ", x)) +
+  ggplot2::scale_size(guide = "none", limits = c(0, ran), range = c(0.1, 3.5)) +
+  ggplot2::scale_color_gradient2(limits = c(-ran, ran), breaks = c(-ran, 0, ran), low = "dodgerblue4", high = "red3", name = "Pearson's correlation coefficient", guide = ggplot2::guide_colorbar(ticks = FALSE)) +
+  ggplot2::labs(x = NULL, y = NULL) +
+  ggplot2::facet_grid(#rows = dplyr::vars(.data$type), 
+                      scales = "free", space = "free", switch = "y") +
+  ggplot2::theme(
+    strip.text.y.left = ggplot2::element_text(angle = 0, size = 8, face = "bold"),
+    axis.ticks = ggplot2::element_blank(),
+    axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 0, size = 8, face = ifelse(levels(data$Module) %in% AD_modules, "bold", "plain")),
+    axis.text.y = ggplot2::element_text(size = 8),
+    panel.background = ggplot2::element_blank(),
+    plot.title.position = "plot",
+    panel.grid = ggplot2::element_blank(),
+    legend.position = "bottom",
+    legend.title.position = "top",
+    legend.title = element_text(size = 8, hjust = 0.5),
+    legend.text = element_text(size = 8),
+    legend.key.height = unit(3, "mm")) 
+}
+
+#checking range for plotting.
+range(prot_effects_for_plotting$correlation)
+
+prot_effects_for_plotting_complete <- prot_effects_for_plotting %>%
+  mutate(covariates_label = case_when(
+    covariates == "Sex" ~ "Sex (M)",
+    covariates == "PSEN1_genotype" ~ "PSEN1\ngenotype"
+  ))
+
+module_corr_plot_proteins <- protein_variant_corrplot(prot_effects_for_plotting_complete, 0.87)
+module_corr_plot_proteins #panel A for figure 5.
+```
+
+Looking at any significant protein modules. 2nd panel for figure 5.
+
+```{r}
+#| label: individual scatterplots for significant protein modules
+#| include: true
+
+#get a list of DEGs for PSEN1 genotype.
+psen1_prot_DEGs <- df_marmo_protlms_output %>%
+  filter(covariates == "PSEN1_genotype" & padj_value < 0.1) %>%
+  select(gene, beta_psen1 = beta, p_value_psen1 = p_value, padj_value_psen1 = padj_value, accessionID_PSEN1 = accessionID)
+PSEN1_genotype_prot_DEGs <- as.vector(psen1_prot_DEGs$gene)
+sum(duplicated(psen1_prot_DEGs$gene))
+
+#initialziing an empty list for storing plots.
+prot_modules_DEGs_plots <- list()
+
+for(i in 1:nrow(prot_effects_for_plotting)){
+  if(prot_effects_for_plotting[i,]$significant1 == TRUE){
+    p <- ggplot(data = prot_effects_for_plotting$data[[i]], aes(x = AD.Control, y = beta)) +
+      geom_point(size = 1, color = "red3", alpha = 0.5) +
+      labs(x = expression(bold(log["2"]("FC") * " in human AD brains")),
+           y = "") +
+      ggtitle(label = gsub("_", " ", prot_effects_for_plotting[i,]$Module)) +
+      geom_hline(yintercept = 0, size = 0.2) +
+      geom_vline(xintercept = 0, size = 0.2) +
+      geom_smooth(method = "lm", color = "red3", fill = "red3", linewidth = 0.75) +
+      theme_classic() +
+      theme(axis.text = element_text(size = 8, color = "black"),
+            axis.ticks = element_line(color = "black"),
+            axis.title = element_text(size = 8),
+            strip.text = element_markdown(size = 8),
+            plot.title = element_text(hjust = 0.5, size = 10, face = "bold"),
+        legend.position = "none")
+      
+    print(p)
+    prot_modules_DEGs_plots[[paste0(prot_effects_for_plotting[i,]$Module, "_", prot_effects_for_plotting[i,]$covariates)]] <- p #storing plots in a list to call later.
+  }
+}
+```
+
+Putting figure 5 together by assembling all panels. 
+1. Topmost row or panel #1 is the module correlation plot. 
+2. Second row has 3 panels, with significant modules chosen for representation.
+
+```{r}
+#| label: assembling figure 5
+#| include: true
+
+#specifying plot arrangement via the 2 rows.
+row1 <- module_corr_plot_proteins 
+
+row2_b <- prot_modules_DEGs_plots[["M37_Endosome_PSEN1_genotype"]] + 
+  labs(y = expression(bold(log["2"]("FC") * " in PSEN1 marmoset fibroblasts"))) 
+
+row2_c <- prot_modules_DEGs_plots[["M2_Mitochondria_Sex"]] + 
+  labs(y = expression(bold(log["2"]("FC") * " in male marmoset fibroblasts"))) 
+
+row2_d <- prot_modules_DEGs_plots[["M7_MAPK_Metabolism_Sex"]] + 
+  labs(y = expression(bold(log["2"]("FC") * " in male marmoset fibroblasts"))) 
+
+row2 <- plot_grid(row2_b, row2_c, row2_d,
+                  labels = c("B", "C", "D"), label_size = 12, label_fontface = "bold",
+                        rel_widths = c(1, 1, 1),
+                        ncol = 3)
+
+#assembling it all together.
+fig5 <- plot_grid(row1, 
+                  row2,
+                  nrow = 2,
+                  labels = c("A", "", "", ""), label_size = 12, label_fontface = "bold",
+                  rel_heights = c(1, 0.9))
+
+#saving figure panel.
+ggsave2(filename = "figure5.pdf", plot = fig5, device = cairo_pdf, path = "../results/final_figs/", height = 150, width = 180, units = "mm", dpi = 600)
+```
+
+Saving linear model results as supplementary information.
+S1: RNA from NanoString,
+S2: Protein from LFQ proteomics done for marmoset fibroblasts.
+
+```{r}
+#| label: saving supplementary tables
+#| include: true
+
+#creating and saving list of dataframes.
+supp_tables <- list("Table S1 Marmoset DEGs" = supptable_S1, "Table S2 Marmoset DEPs" = supptable_S2)
+write_xlsx(supp_tables, path = "../results/SupplementaryTables.xlsx")
+```
+
+This marks the end of this document. For details on tool versions needed to reproduce this analysis, please refer to the session information given below.
+
+```{r}
+#| label: session details
+#| include: true
+
+sessionInfo()
+```
